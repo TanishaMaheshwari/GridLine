@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block content %}
+<!-- ============ HISTORY ============ -->
+<div class="screen" id="screen-history">
+  <div class="acct-header">
+    <div class="acct-header-left">
+      <button class="back-btn" id="back-to-account">←</button>
+      <div class="acct-header-titles">
+        <div class="acct-name">Trade history</div>
+        <div class="acct-id" id="history-acct-id"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="history-wrap">
+    <div class="history-top">
+      <div class="history-filters" id="history-filters">
+        <div class="chip-filter active" data-symbol="">All symbols</div>
+      </div>
+      <div class="history-query-controls">
+        <label>From <input id="history-from" type="datetime-local"></label>
+        <label>To <input id="history-to" type="datetime-local"></label>
+        <label>Type
+          <select id="history-type">
+            <option value="">All trades</option>
+            <option value="Buy">Buy</option>
+            <option value="Sell">Sell</option>
+          </select>
+        </label>
+        <button class="btn-secondary history-reset" id="history-reset" type="button">Reset</button>
+      </div>
+    </div>
+
+    <table class="history" id="history-table">
+      <thead>
+        <tr>
+          <th>Ticket</th><th>Symbol</th><th>Type</th><th>Open time</th><th>Open price</th><th>Close time</th><th>Close price</th><th>Qty</th><th>Profit</th>
+        </tr>
+      </thead>
+      <tbody id="history-body"></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
