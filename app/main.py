@@ -55,31 +55,31 @@ def index(request: Request):
         "account_id": None,
         "static_version": get_static_version(),
     }
-    return templates.TemplateResponse("login.html", ctx)
+    return templates.TemplateResponse(request, "login.html", ctx)
 
 
 @app.get("/login")
 def login_redirect(request: Request):
     ctx = {"request": request, "title": os.getenv('APP_TITLE', 'Gridline'), "env": os.getenv('APP_ENV', 'development'), "api_base": os.getenv('API_BASE', '/api'), "account_id": None, "static_version": get_static_version()}
-    return templates.TemplateResponse("login.html", ctx)
+    return templates.TemplateResponse(request, "login.html", ctx)
 
 
 @app.get("/dashboard")
 def dashboard(request: Request):
     ctx = {"request": request, "title": os.getenv('APP_TITLE', 'Gridline'), "env": os.getenv('APP_ENV', 'development'), "api_base": os.getenv('API_BASE', '/api'), "account_id": None, "static_version": get_static_version()}
-    return templates.TemplateResponse("dashboard.html", ctx)
+    return templates.TemplateResponse(request, "dashboard.html", ctx)
 
 
 @app.get("/account/{account_id}")
 def account_view(request: Request, account_id: int):
     ctx = {"request": request, "title": os.getenv('APP_TITLE', 'Gridline'), "env": os.getenv('APP_ENV', 'development'), "api_base": os.getenv('API_BASE', '/api'), "account_id": account_id, "static_version": get_static_version()}
-    return templates.TemplateResponse("accounts.html", ctx)
+    return templates.TemplateResponse(request, "accounts.html", ctx)
 
 
 @app.get("/history")
 def history_view(request: Request, account_id: int | None = None):
     ctx = {"request": request, "title": os.getenv('APP_TITLE', 'Gridline'), "env": os.getenv('APP_ENV', 'development'), "api_base": os.getenv('API_BASE', '/api'), "account_id": account_id, "static_version": get_static_version()}
-    return templates.TemplateResponse("history.html", ctx)
+    return templates.TemplateResponse(request, "history.html", ctx)
 
 
 @app.get("/api/health")
