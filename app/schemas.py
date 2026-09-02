@@ -59,12 +59,13 @@ class LimitRowOut(BaseModel):
     id: int
     row_index: int
     status: str
+    ea_status_text: Optional[str] = None   # NEW
     updated_at: Optional[str] = None
-    buy_price: Optional[float] = None
+    buy_price: float
     sell_qty: Optional[float] = None
-    sell_price: Optional[float] = None
+    sell_price: float
     buy_qty: Optional[float] = None
-
+    
 
 class PushedRowOut(BaseModel):
     id: int
