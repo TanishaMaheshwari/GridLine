@@ -1,11 +1,29 @@
 /* ================= FILL GRID ================= */
-const GRID_ROWS = 30;
-const gridData = [];
-for(let r=0;r<GRID_ROWS;r++) gridData.push(['','','','']);
-const pushState = new Array(GRID_ROWS).fill('idle');
-const pushTime = new Array(GRID_ROWS).fill('');
-const rowIds = new Array(GRID_ROWS).fill(null);
-const eaStatusText = new Array(GRID_ROWS).fill(null);
+let GRID_ROWS = 30;
+const ROWS_PER_EXTEND = 10;
+
+let gridData = [];
+let pushState = [];
+let pushTime = [];
+let rowIds = [];
+let eaStatusText = [];
+
+function addEmptyRows(count){
+  for(let i=0; i<count; i++){
+    gridData.push(['','','','']);
+    pushState.push('idle');
+    pushTime.push('');
+    rowIds.push(null);
+    eaStatusText.push(null);
+  }
+}
+addEmptyRows(GRID_ROWS);
+
+function extendGrid(n){
+  addEmptyRows(n);
+  GRID_ROWS += n;
+  renderGrid();
+}
 
 const tbody = document.getElementById('fillgrid-body');
 
@@ -81,6 +99,16 @@ function renderGrid(){
 
     tbody.appendChild(tr);
   }
+
+  // Footer row — "+ Add N rows" button spanning the full table width
+  const trAdd = document.createElement('tr');
+  trAdd.className = 'add-rows-row';
+  const tdAdd = document.createElement('td');
+  tdAdd.colSpan = 7;
+  tdAdd.innerHTML = `<button class="btn-add-rows-inline" id="btn-add-rows">+ Add ${ROWS_PER_EXTEND} rows</button>`;
+  trAdd.appendChild(tdAdd);
+  tbody.appendChild(trAdd);
+
   applySelectionClasses();
 
   if(focusedRow !== null){
