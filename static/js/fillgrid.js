@@ -304,6 +304,10 @@ if(pushBtn){
 
 if(tbody){
   tbody.addEventListener('click', (e)=>{
+    if(e.target.closest('#btn-add-rows')){
+      extendGrid(ROWS_PER_EXTEND);
+      return;
+    }
     const btn = e.target.closest('.status-recall');
     if(!btn) return;
     requestRemove(parseInt(btn.dataset.row));
