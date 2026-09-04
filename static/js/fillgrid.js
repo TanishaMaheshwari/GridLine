@@ -32,6 +32,19 @@ function fmt(v){
   return (Math.round(v*100)/100).toString();
 }
 
+function getScrollAncestor(el){
+  let node = el.parentElement;
+  while(node && node !== document.body){
+    const style = getComputedStyle(node);
+    if((style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+       node.scrollHeight > node.clientHeight){
+      return node;
+    }
+    node = node.parentElement;
+  }
+  return null; // nothing scrollable found — falls back to window scroll below
+}
+
 // Renders the whole grid. If an input inside the grid currently has focus,
 // its row/col + cursor position (selectionStart/End) are remembered before
 // the rebuild and restored after, so a background poll (see startPolling
@@ -46,6 +59,8 @@ function renderGrid(){
   const focusedCol = wasInGrid ? parseInt(focusedEl.dataset.col) : null;
   const selStart = wasInGrid ? focusedEl.selectionStart : null;
   const selEnd = wasInGrid ? focusedEl.selectionEnd : null;
+  const scrollAncestor = getScrollAncestor(tbody);
+  const savedScrollTop = scrollAncestor ? scrollAncestor.scrollTop : window.scrollY;
 
   tbody.innerHTML = '';
   for(let r=0;r<GRID_ROWS;r++){
@@ -120,6 +135,9 @@ function renderGrid(){
       }
     }
   }
+
+  if(scrollAncestor) scrollAncestor.scrollTop = savedScrollTop;
+  else window.scrollTo(0, savedScrollTop);
 }
 
 /* ---- selection / fill-handle (same UX as the prototype) ---- */
