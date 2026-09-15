@@ -535,3 +535,22 @@
   ::-webkit-scrollbar{height:8px;width:8px;} 
   ::-webkit-scrollbar-thumb{background:var(--border);border-radius:8px;} 
   ::-webkit-scrollbar-track{background:transparent;} 
+
+.status-edit {
+  /* copy .status-recall's box-model (padding/border/font-size) and just change color, e.g. */
+  color: var(--buy, #2e7d32);
+  border-color: var(--buy, #2e7d32);
+}
+.status-pill-mini.side-buy {
+  color: #4ade80; /* green */
+}
+.status-pill-mini.side-buy .status-dot {
+  background: #4ade80;
+}
+
+.status-pill-mini.side-sell {
+  color: #f87171; /* red */
+}
+.status-pill-mini.side-sell .status-dot {
+  background: #f87171;
+}

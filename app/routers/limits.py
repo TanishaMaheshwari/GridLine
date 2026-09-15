@@ -66,7 +66,7 @@ def get_limits(
             row_index=r.row_index,
             status=r.status,
             ea_status_text=r.ea_status_text,   # NEW
-            updated_at=r.updated_at.isoformat() if r.updated_at else None,
+            updated_at=(r.updated_at.isoformat() + "Z") if r.updated_at else None,
             buy_price=r.buy_price,
             sell_qty=r.qty,
             sell_price=r.sell_price,

@@ -183,6 +183,12 @@ Each contract expiry:
 
 
 create account
-curl -X POST http://localhost:8000/api/auth/signup \
-  -H "Content-Type: application/json" \
-  -d '{"email":"you@example.com","password":"yourpassword"}'# GridLine
+curl -X POST http://localhost:8000/api/auth/signup \ -H "Content-Type: application/json" \ -d '{"email":"you@example.com","password":"yourpassword"}'
+
+							-132308.1
+							
+-1750, 95.56	132868	360	54	138371	297159.3	972	
+	157136	100	54	150912	-336096	162	-40070.70
+							
+	132868	720	108	143622	1161426.6	1944	
+	162499	200	108	150912	-1251396	324	-92237.40

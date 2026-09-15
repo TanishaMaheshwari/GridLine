@@ -95,7 +95,8 @@ function renderGrid(){
     let pillHtml;
     if(pushState[r]==='placed'){
       const label = eaStatusText[r] || 'EA active';
-      pillHtml = `<span class="status-pill-mini placed-buy"><span class="status-dot"></span>${escapeHtml(label)}</span>`;
+      const sideClass = /sell/i.test(label) ? 'side-sell' : (/buy/i.test(label) ? 'side-buy' : '');
+      pillHtml = `<span class="status-pill-mini placed ${sideClass}"><span class="status-dot"></span>${escapeHtml(label)}</span>`;
     } else if(pushState[r]==='pending'){
       pillHtml = `<span class="status-pill-mini pending"><span class="status-dot"></span>Saved — awaiting EA</span>`;
     } else if(hasPrice){
@@ -103,8 +104,25 @@ function renderGrid(){
     } else {
       pillHtml = `<span class="status-pill-mini"><span class="status-dot"></span>Empty</span>`;
     }
-    const showRemove = pushState[r]==='placed' || pushState[r]==='pending';
-    tdStatus.innerHTML = `<div class="status-cell-inner">${pillHtml}${showRemove ? `<button class="status-recall" data-row="${r}">Remove</button>` : ''}</div>`;
+    const showActions = pushState[r]==='placed' || pushState[r]==='pending';
+    const actionsHtml = showActions
+      ? `<button class="status-icon-btn status-edit" data-row="${r}" aria-label="Edit row ${r+1}" title="Edit">
+           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+             <path d="M12 20h9"/>
+             <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/>
+           </svg>
+         </button>
+         <button class="status-icon-btn status-recall" data-row="${r}" aria-label="Remove row ${r+1}" title="Remove">
+           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+             <path d="M3 6h18"/>
+             <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+             <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+             <path d="M10 11v6"/>
+             <path d="M14 11v6"/>
+           </svg>
+         </button>`
+      : '';
+    tdStatus.innerHTML = `<div class="status-cell-inner">${pillHtml}${actionsHtml}</div>`;  
     tr.appendChild(tdStatus);
 
     const tdUpdate = document.createElement('td');
@@ -143,6 +161,17 @@ function renderGrid(){
 /* ---- selection / fill-handle (same UX as the prototype) ---- */
 const sel = { col:null, start:null, end:null, active:false };
 const fillState = { active:false, previewEnd:null };
+
+function formatIST(isoString){
+  try{
+    return new Date(isoString).toLocaleTimeString('en-GB', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+  }catch(e){
+    return '';
+  }
+}
 
 function applySelectionClasses(){
   tbody.querySelectorAll('td.gcell').forEach(td=>{
@@ -256,7 +285,7 @@ async function syncFromServer(){
     if(r < 0 || r >= GRID_ROWS) return;
     rowIds[r] = row.id;
     pushState[r] = row.status;
-    pushTime[r] = row.updated_at ? new Date(row.updated_at).toTimeString().slice(0,8) : '';
+    pushTime[r] = row.updated_at ? formatIST(row.updated_at) : '';
     eaStatusText[r] = row.ea_status_text ?? null;
     gridData[r][0] = row.buy_price ?? '';
     gridData[r][1] = row.sell_qty ?? '';
@@ -326,10 +355,39 @@ if(tbody){
       extendGrid(ROWS_PER_EXTEND);
       return;
     }
-    const btn = e.target.closest('.status-recall');
-    if(!btn) return;
-    requestRemove(parseInt(btn.dataset.row));
+    const editBtn = e.target.closest('.status-edit');
+    if(editBtn){ requestEdit(parseInt(editBtn.dataset.row)); return; }
+    const removeBtn = e.target.closest('.status-recall');
+    if(removeBtn){ requestRemove(parseInt(removeBtn.dataset.row)); return; }
   });
+}
+async function requestEdit(r){
+  const id = rowIds[r];
+  if(!id) return;
+  const savedValues = [...gridData[r]]; // keep the numbers — the server is about to forget them
+  try{
+    await apiPost(`/api/accounts/${API.accountId}/limits/remove`, { symbol: API.symbol, row_ids: [id] });
+    showToast('Row unlocked for editing — re-push when ready');
+    await syncFromServer();
+    // syncFromServer() blanks this row since the backend has no memory of it
+    // anymore (remove = delete, not unlock) — put the values back so editing
+    // starts from what was there, not from empty cells.
+    gridData[r] = savedValues;
+    pushState[r] = 'idle';
+    pushTime[r] = '';
+    rowIds[r] = null;
+    eaStatusText[r] = null;
+    renderGrid();
+    const cell = tbody.querySelector(`input[data-row="${r}"][data-col="0"]`);
+    if(cell){
+      cell.focus();
+      const len = cell.value.length;
+      cell.setSelectionRange(len, len);
+    }
+  }catch(err){
+    console.error(err);
+    showToast('Could not unlock row for editing');
+  }
 }
 async function requestRemove(r){
   const id = rowIds[r];

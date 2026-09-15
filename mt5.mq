@@ -1,0 +1,1390 @@
+//+------------------------------------------------------------------+
+//|                          GridLadder_EA.mq5                       |
+//|        Gold  (Current Month Only)                                |
+//|        v4.9r5 — Real fill-lock confirmation logic + sell-side    |
+//|                 lock stamp fix                                   |
+//+------------------------------------------------------------------+
+
+#property copyright "Grid Ladder EA"
+#property version   "4.095"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\OrderInfo.mqh>
+
+bool   ParseJSON(string json);
+string MapSymbol(string raw);
+
+input group "═══ Contracts ═══"
+input string   InpGold        = "GCDEC";   // update each rollover
+input double   InpLotSize     = 0.1;         // fallback if sheet buy_qty blank
+
+input group "═══ Google Sheet ═══"
+//InpGet  = http://YOUR_VPS_PUBLIC_IP:8000/api/ea/<account_id>/ladder?key=<ea_api_key>&symbol=GOLDOCT
+//InpPost = http://YOUR_VPS_PUBLIC_IP:8000/api/ea/<account_id>/exec?key=<ea_api_key>
+input string   InpGetURL       = "http://160.250.204.114:8000/api/ea/3/ladder?key=OKuS35_a2UDAhcQXX2Bg9ArkMWAYSMfe&symbol=GCDEC";
+input string   InpPostURL      = "http://160.250.204.114:8000/api/ea/3/exec?key=OKuS35_a2UDAhcQXX2Bg9ArkMWAYSMfe";
+input int      InpPollSeconds  = 10;
+
+input group "═══ Execution ═══"
+input int      InpMagic             = 1123342;
+input int      InpSlippage          = 10;
+input int      InpRetryCount        = 3;
+input int      InpRetryDelay        = 1000;
+input int      InpQueueRetrySeconds = 30;
+
+input group "═══ Dead Man Switch ═══"
+input int      InpDeadManSeconds = 300;  // alert if no successful sync for this long (seconds)
+
+input group "═══ Debug ═══"
+input bool     InpVerboseLog   = true;
+
+#define MAX_ROWS                  200
+#define MAX_SYMBOLS               1   // [v4.9r5-6] this build only ever registers one symbol
+#define ROW_PREFIX                "GL_"
+#define HTTP_TIMEOUT              20000
+#define MAX_QUEUE                 200
+#define MAX_PLACED_CACHE          400
+#define PLACED_TTL                30
+#define FILL_LOCK_HARD_CEILING    300   // [v4.9r4-1] hard fallback if sheet never confirms
+#define INIT_HOLD_SECONDS         15
+#define LOG_FILE                  "GridLadder_log.csv"
+#define QUEUE_FILE                "GridLadder_queue.csv"
+#define FILLLOCK_FILE             "GridLadder_filllock.csv"
+#define FILL_MEMORY_WINDOW  (FILL_LOCK_HARD_CEILING + 60)  // [v4.9r5-5]
+
+#define FETCH_OK        1
+#define FETCH_EMPTY     2
+#define FETCH_ERROR     3
+
+#define ALERT_HIGH      1
+#define ALERT_CRITICAL  2
+
+
+// ────────────────────────────────────────────────────────────────────
+//  DATA STRUCTURES
+// ────────────────────────────────────────────────────────────────────
+
+struct GridRow
+  {
+   int    rowIndex;
+   string symbol;
+   double buyPrice;
+   double qty;
+   double sellPrice;
+   double lotSize;
+   bool   valid;
+  };
+
+struct QueueEntry
+  {
+   int    id;
+   string payload;
+   string url;
+   bool   sent;
+   string createdAt;
+   string sentAt;
+  };
+
+struct TradeRecord
+  {
+   string tradeTime;
+   string symbol;
+   double buyPrice;
+   double qty;
+   double sellPrice;
+   double brokerage;
+   double profit;
+  };
+
+struct PlacedOrder
+  {
+   string   tag;
+   datetime placedAt;
+  };
+
+
+// ────────────────────────────────────────────────────────────────────
+//  GLOBALS
+// ────────────────────────────────────────────────────────────────────
+
+CTrade   g_trade;
+GridRow  g_rows[MAX_ROWS];
+int      g_rowCount    = 0;
+bool     g_initialized = false;
+
+QueueEntry g_queue[MAX_QUEUE];
+int        g_queueSize   = 0;
+int        g_nextQueueId = 1;
+
+string g_symbols[MAX_SYMBOLS];
+int    g_symbolCount = 0;
+int    g_timerTick   = 0;
+
+PlacedOrder g_placedCache[MAX_PLACED_CACHE];
+int         g_placedCount = 0;
+
+// [v4.9r4-1] g_fillLockTime[]   — when the fill happened (for ceiling calculation)
+//            g_fillLockActive[] — is the lock currently held?
+// [v4.9r5-1] g_fillLockWaitBuy[] — which side is this lock waiting to confirm?
+//            true  = waiting for sheet qty >= 0.05 (buy fill confirmed)
+//            false = waiting for sheet qty <  0.05 (sell fill confirmed)
+//            Single symbol here, so a plain 1-D array (keyed by row) is safe —
+//            no risk of two symbols sharing a row-number slot.
+datetime g_fillLockTime[MAX_ROWS];
+bool     g_fillLockActive[MAX_ROWS];
+bool     g_fillLockWaitBuy[MAX_ROWS];
+datetime g_initTime = 0;
+
+// [v4.9r3-1] Reconnect and dead man state
+datetime g_lastSuccessfulSync = 0;
+bool     g_wasDisconnected    = false;
+datetime g_disconnectTime     = 0;
+datetime g_lastDeadManAlert   = 0;
+
+
+// ════════════════════════════════════════════════════════════════════
+//  LOGGING
+// ════════════════════════════════════════════════════════════════════
+
+// Forward declaration so LogEvent can call PostWarning
+void PostWarning(string level, string category, string symbol, string message);
+
+void WriteLogLine(string line)
+  {
+   int handle = FileOpen(LOG_FILE, FILE_WRITE|FILE_READ|FILE_CSV|FILE_COMMON, ',');
+   if(handle == INVALID_HANDLE)
+     { Print("⚠️ Cannot open log: ", GetLastError()); return; }
+   FileSeek(handle, 0, SEEK_END);
+   FileWrite(handle, line);
+   FileClose(handle);
+  }
+
+void LogEvent(string level, string category, string symbol,
+              string message, string extra = "")
+  {
+   string ts   = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
+   string line = StringFormat("%s,%s,%s,%s,%s,%s", ts, level, category, symbol, message, extra);
+   WriteLogLine(line);
+   if(InpVerboseLog || level != "INFO")
+      PrintFormat("[%s][%s][%s] %s %s", level, category, symbol, message, extra);
+
+   // [v4.9r4-2] Route WARN/ERROR to sheet warnings tab.
+   // QUEUE category excluded — a POST failure inside PostWarning would
+   // recurse and spam the queue endlessly.
+   if((level == "WARN" || level == "ERROR") && category != "QUEUE")
+      PostWarning(level, category, symbol,
+                  message + (extra != "" ? " | " + extra : ""));
+  }
+
+
+// ════════════════════════════════════════════════════════════════════
+//  ALERT SYSTEM
+// ════════════════════════════════════════════════════════════════════
+
+void SendAlert(string message, int severity = ALERT_HIGH)
+  {
+   LogEvent("WARN", "ALERT", "", message);
+   SendNotification("EA: " + message);
+  }
+void StopEA(string reason)
+  {
+   LogEvent("ERROR", "SYSTEM", "", "🛑 EA STOPPING — " + reason);
+   SendAlert("EA STOPPED: " + reason, ALERT_CRITICAL);
+   ExpertRemove();
+  }
+  
+
+// ════════════════════════════════════════════════════════════════════
+//  PLACED-ORDER CACHE
+// ════════════════════════════════════════════════════════════════════
+
+bool IsRecentlyPlaced(string tag)
+  {
+   datetime cutoff = TimeCurrent() - PLACED_TTL;
+   for(int i = 0; i < g_placedCount; i++)
+     {
+      if(g_placedCache[i].placedAt < cutoff) continue;
+      if(g_placedCache[i].tag == tag)        return true;
+     }
+   return false;
+  }
+
+void MarkPlaced(string tag)
+  {
+   int slot = g_placedCount % MAX_PLACED_CACHE;
+   g_placedCache[slot].tag      = tag;
+   g_placedCache[slot].placedAt = TimeCurrent();
+   if(g_placedCount < MAX_PLACED_CACHE) g_placedCount++;
+  }
+
+
+// ════════════════════════════════════════════════════════════════════
+//  FILL DETECTION
+// ════════════════════════════════════════════════════════════════════
+
+// [v4.9r5-5] FIX: window widened from a hardcoded 120s to FILL_MEMORY_WINDOW
+// (ceiling + 60s buffer) so a fill near the lock ceiling isn't missed.
+bool WasRecentlyFilled(string tag, string symbol, ENUM_ORDER_TYPE expectedType,
+                        int rowIndex, double expectedPrice = 0)
+{
+   HistorySelect(TimeCurrent() - FILL_MEMORY_WINDOW, TimeCurrent());
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+
+   for(int i = 0; i < HistoryOrdersTotal(); i++)
+     {
+      ulong ticket = HistoryOrderGetTicket(i);
+      if(HistoryOrderGetString(ticket,  ORDER_SYMBOL) != symbol)             continue;
+      if(HistoryOrderGetInteger(ticket, ORDER_STATE)  != ORDER_STATE_FILLED) continue;
+      if((ENUM_ORDER_TYPE)HistoryOrderGetInteger(ticket, ORDER_TYPE) != expectedType) continue;
+
+      string oComment = HistoryOrderGetString(ticket, ORDER_COMMENT);
+
+      // Primary: exact tag match
+      if(oComment == tag) return true;
+
+      // Secondary: comment IS one of our own tags (has ROW_PREFIX) but the
+      // exact string differs — trust the parsed row number, not price.
+      // This covers session restarts / symbol renames without opening the
+      // door to cross-row price collisions.
+      int parsedRow = ParseRowIndex(oComment);
+      if(parsedRow >= 0)
+        {
+         if(parsedRow == rowIndex)
+           {
+            LogEvent("WARN", "ORDER", symbol,
+                     StringFormat("WasRecentlyFilled: tag mismatch but row matched — "
+                                  "row=%d comment='%s' expected tag='%s'",
+                                  rowIndex, oComment, tag));
+            return true;
+           }
+         continue; // belongs to a different row — never fall through to price match
+        }
+
+      // Tertiary: comment has no ROW_PREFIX at all — a genuine external/manual
+      // order. Only here does price proximity apply, and only as a weak signal
+      // since row spacing can be under 0.05 — kept tight to reduce collisions.
+      if(expectedPrice > 0 &&
+         MathAbs(HistoryOrderGetDouble(ticket, ORDER_PRICE_OPEN) - expectedPrice) < point * 2)
+        {
+         LogEvent("WARN", "ORDER", symbol,
+                  StringFormat("WasRecentlyFilled: price-match hit (no tag) for row=%d "
+                               "at price=%.2f (comment was '%s')",
+                               rowIndex, expectedPrice, oComment));
+         return true;
+        }
+     }
+   return false;
+}
+
+
+// ════════════════════════════════════════════════════════════════════
+//  MANUAL ORDER DETECTION
+// ════════════════════════════════════════════════════════════════════
+
+bool AnyOrderAtPrice(double price, ENUM_ORDER_TYPE type, string symbol)
+  {
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   for(int i = 0; i < OrdersTotal(); i++)
+     {
+      ulong ticket = OrderGetTicket(i); if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != symbol) continue;
+      if((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) != type) continue;
+      if(MathAbs(OrderGetDouble(ORDER_PRICE_OPEN) - price) < point)
+         return true;
+     }
+   return false;
+  }
+
+
+// ════════════════════════════════════════════════════════════════════
+//  FILL LOCK PERSISTENCE  [v4.9r4-1 / v4.9r5-3]
+//
+//  Persists the fill timestamp, active flag, AND waitBuy direction so a
+//  restart mid-lock correctly restores full state. Expired or inactive
+//  locks are dropped on load.
+// ════════════════════════════════════════════════════════════════════
+
+void SaveFillLocks()
+  {
+   int handle = FileOpen(FILLLOCK_FILE, FILE_WRITE|FILE_CSV|FILE_COMMON, ',');
+   if(handle == INVALID_HANDLE)
+     { LogEvent("WARN", "SYSTEM", "", "Cannot save fill locks"); return; }
+   datetime ceiling = TimeCurrent() - FILL_LOCK_HARD_CEILING;
+   for(int i = 0; i < MAX_ROWS; i++)
+     {
+      if(!g_fillLockActive[i])              continue;
+      if(g_fillLockTime[i] <= ceiling)      continue;
+      FileWrite(handle, i, (long)g_fillLockTime[i], 1, g_fillLockWaitBuy[i] ? 1 : 0);
+     }
+   FileClose(handle);
+  }
+
+void LoadFillLocks()
+  {
+   ArrayInitialize(g_fillLockTime,    0);
+   ArrayInitialize(g_fillLockActive,  false);
+   ArrayInitialize(g_fillLockWaitBuy, false);
+   if(!FileIsExist(FILLLOCK_FILE, FILE_COMMON)) return;
+   int handle = FileOpen(FILLLOCK_FILE, FILE_READ|FILE_CSV|FILE_COMMON, ',');
+   if(handle == INVALID_HANDLE) return;
+   datetime ceiling = TimeCurrent() - FILL_LOCK_HARD_CEILING;
+   int loaded = 0;
+   while(!FileIsEnding(handle))
+     {
+      string idxStr    = FileReadString(handle);
+      string timeStr   = FileReadString(handle);
+      string activeStr = FileReadString(handle);
+      string waitStr   = FileReadString(handle);
+      if(idxStr == "") continue;
+      int      idx     = (int)StringToInteger(idxStr);
+      datetime ts      = (datetime)StringToInteger(timeStr);
+      bool     active  = (StringToInteger(activeStr) == 1);
+      bool     waitBuy = (StringToInteger(waitStr) == 1);
+      if(idx < 0 || idx >= MAX_ROWS) continue;
+      if(!active || ts <= ceiling)   continue;
+      g_fillLockTime[idx]    = ts;
+      g_fillLockActive[idx]  = true;
+      g_fillLockWaitBuy[idx] = waitBuy;
+      loaded++;
+     }
+   FileClose(handle);
+   if(loaded > 0)
+      LogEvent("INFO", "SYSTEM", "",
+               StringFormat("Restored %d active fill lock(s) from disk", loaded));
+  }
+
+
+// ════════════════════════════════════════════════════════════════════
+//  LAYER 2 — RECONNECT RECONCILIATION
+// ════════════════════════════════════════════════════════════════════
+
+void ReconcileAfterReconnect()
+  {
+   int gapSecs = (int)(TimeCurrent() - g_disconnectTime);
+
+   LogEvent("INFO", "SYSTEM", "",
+            StringFormat("Reconnect reconcile — gap=%ds [%s → now]",
+                         gapSecs,
+                         TimeToString(g_disconnectTime, TIME_SECONDS)));
+
+   datetime scanFrom = g_disconnectTime - 30;
+   HistorySelect(scanFrom, TimeCurrent());
+
+   int total = HistoryDealsTotal();
+   int recoveredCount = 0;
+
+   for(int i = 0; i < total; i++)
+     {
+      ulong ticket = HistoryDealGetTicket(i);
+      if((long)HistoryDealGetInteger(ticket, DEAL_MAGIC) != InpMagic) continue;
+
+      datetime fillTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      if(fillTime < scanFrom) continue;
+
+      string comment   = HistoryDealGetString (ticket, DEAL_COMMENT);
+      long   dealType  = HistoryDealGetInteger(ticket, DEAL_TYPE);
+      long   dealEntry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+      double dealPrice = HistoryDealGetDouble (ticket, DEAL_PRICE);
+      double dealVol   = HistoryDealGetDouble (ticket, DEAL_VOLUME);
+      string sym       = HistoryDealGetString (ticket, DEAL_SYMBOL);
+      int    rowIndex  = ParseRowIndex(comment);
+
+      if(rowIndex < 0) continue;
+
+      bool isBuy  = (dealType == DEAL_TYPE_BUY  && dealEntry == DEAL_ENTRY_IN);
+      bool isSell = (dealType == DEAL_TYPE_SELL && dealEntry == DEAL_ENTRY_OUT);
+      if(!isBuy && !isSell) continue;
+
+      recoveredCount++;
+
+      LogEvent("WARN", "SYSTEM", sym,
+               StringFormat("Gap %s recovered row=%d price=%.2f — updating sheet",
+                            isBuy ? "BUY" : "SELL", rowIndex, dealPrice));
+
+      bool healed = isBuy
+        ? TrySheetUpdateSync(rowIndex, dealVol, "BUY_FILLED", sym)
+        : TrySheetUpdateSync(rowIndex, 0.0, "SELL_FILLED", sym);
+
+      if(healed)
+        {
+         if(rowIndex < MAX_ROWS && g_fillLockTime[rowIndex] < fillTime)
+           {
+            g_fillLockTime[rowIndex]    = fillTime;
+            g_fillLockActive[rowIndex]  = true;
+            g_fillLockWaitBuy[rowIndex] = isBuy;
+            SaveFillLocks();
+           }
+         SendAlert(StringFormat("GAP FILL RECOVERED — %s %s @ %.2f",
+                                isBuy ? "BUY" : "SELL", sym, dealPrice),
+                   isBuy ? ALERT_HIGH : ALERT_CRITICAL);
+        }
+      else
+        {
+         string pending = "";
+         for(int j = i + 1; j < total; j++)
+           {
+            ulong jTicket = HistoryDealGetTicket(j);
+            if((long)HistoryDealGetInteger(jTicket, DEAL_MAGIC) != InpMagic) continue;
+            datetime jTime = (datetime)HistoryDealGetInteger(jTicket, DEAL_TIME);
+            if(jTime < scanFrom) continue;
+            string jComment = HistoryDealGetString(jTicket, DEAL_COMMENT);
+            int    jRow     = ParseRowIndex(jComment);
+            long   jType    = HistoryDealGetInteger(jTicket, DEAL_TYPE);
+            long   jEntry   = HistoryDealGetInteger(jTicket, DEAL_ENTRY);
+            bool   jIsBuy   = (jType == DEAL_TYPE_BUY  && jEntry == DEAL_ENTRY_IN);
+            bool   jIsSell  = (jType == DEAL_TYPE_SELL && jEntry == DEAL_ENTRY_OUT);
+            if(jRow < 0 || (!jIsBuy && !jIsSell)) continue;
+            string jSym = HistoryDealGetString(jTicket, DEAL_SYMBOL);
+            pending += StringFormat("%s row=%d(%s) ", jSym, jRow, jIsBuy ? "BUY" : "SELL");
+           }
+
+         StopEA(StringFormat(
+            "Gap %s row=%d recovered from history but sheet update failed after 3 attempts "
+            "(price=%.2f). %s%s",
+            isBuy ? "BUY" : "SELL", rowIndex, dealPrice,
+            pending == "" ? "No other pending deals in this scan."
+                          : "Also still pending (fix manually before restart): ",
+            pending));
+         return;
+        }
+     }
+
+   if(recoveredCount == 0)
+      LogEvent("INFO", "SYSTEM", "",
+               StringFormat("Reconcile complete — no fills found in %ds gap", gapSecs));
+   else
+      LogEvent("WARN", "SYSTEM", "",
+               StringFormat("Reconcile complete — %d fill(s) recovered from gap", recoveredCount));
+
+   g_wasDisconnected = false;
+  }
+
+
+// ════════════════════════════════════════════════════════════════════
+//  RETRY QUEUE
+// ════════════════════════════════════════════════════════════════════
+
+void SaveQueueToDisk()
+  {
+   int handle = FileOpen(QUEUE_FILE, FILE_WRITE|FILE_CSV|FILE_COMMON, '\t');
+   if(handle == INVALID_HANDLE) return;
+   for(int i = 0; i < g_queueSize; i++)
+      if(!g_queue[i].sent)
+         FileWrite(handle, g_queue[i].id, g_queue[i].payload,
+                   g_queue[i].url, g_queue[i].createdAt);
+   FileClose(handle);
+  }
+
+void LoadQueueFromDisk()
+  {
+   g_queueSize = 0;
+   if(!FileIsExist(QUEUE_FILE, FILE_COMMON)) return;
+   int handle = FileOpen(QUEUE_FILE, FILE_READ|FILE_CSV|FILE_COMMON, '\t');
+   if(handle == INVALID_HANDLE) return;
+   while(!FileIsEnding(handle) && g_queueSize < MAX_QUEUE)
+     {
+      string idxStr    = FileReadString(handle);
+      string payload   = FileReadString(handle);
+      string url       = FileReadString(handle);
+      string createdAt = FileReadString(handle);
+      if(idxStr == "") continue;
+      int id = (int)StringToInteger(idxStr);
+      if(id >= g_nextQueueId) g_nextQueueId = id + 1;
+      g_queue[g_queueSize].id        = id;
+      g_queue[g_queueSize].payload   = payload;
+      g_queue[g_queueSize].url       = url;
+      g_queue[g_queueSize].sent      = false;
+      g_queue[g_queueSize].createdAt = createdAt;
+      g_queue[g_queueSize].sentAt    = "";
+      g_queueSize++;
+     }
+   FileClose(handle);
+   if(g_queueSize > 0)
+      LogEvent("INFO", "QUEUE", "", StringFormat("Loaded %d unsent items", g_queueSize));
+  }
+
+string EnrichJSON(string jsonBody, int qid)
+  {
+   int lastBrace = -1;
+   for(int i = StringLen(jsonBody) - 1; i >= 0; i--)
+      if(StringGetCharacter(jsonBody, i) == '}') { lastBrace = i; break; }
+   if(lastBrace < 0) return jsonBody;
+   return StringSubstr(jsonBody, 0, lastBrace)
+        + StringFormat(",\"qid\":%d}", qid);
+  }
+
+int QueuePost(string url, string jsonBody)
+  {
+   if(g_queueSize >= MAX_QUEUE)
+     {
+      LogEvent("ERROR", "QUEUE", "", "Queue full — dropping oldest");
+      for(int i = 0; i < g_queueSize - 1; i++) g_queue[i] = g_queue[i + 1];
+      g_queueSize--;
+     }
+   int    newId    = g_nextQueueId++;
+   string ts       = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
+   string enriched = EnrichJSON(jsonBody, newId);
+   g_queue[g_queueSize].id        = newId;
+   g_queue[g_queueSize].payload   = enriched;
+   g_queue[g_queueSize].url       = url;
+   g_queue[g_queueSize].sent      = false;
+   g_queue[g_queueSize].createdAt = ts;
+   g_queue[g_queueSize].sentAt    = "";
+   g_queueSize++;
+   SaveQueueToDisk();
+   LogEvent("INFO", "QUEUE", "", StringFormat("Queued qid=%d", newId));
+   return newId;
+  }
+
+bool TrySendEntry(int idx)
+  {
+   char post[], result[]; string resHeaders;
+   int len = StringToCharArray(g_queue[idx].payload, post, 0, -1, CP_UTF8);
+   ArrayResize(post, len - 1);
+
+   LogEvent("INFO", "QUEUE", "", StringFormat("Sending qid=%d payload=%s", g_queue[idx].id, g_queue[idx].payload));
+
+   int http = WebRequest("POST", g_queue[idx].url, "Content-Type: application/json\r\n",
+                         HTTP_TIMEOUT, post, result, resHeaders);
+   if(http == 200)
+     {
+      g_queue[idx].sent   = true;
+      g_queue[idx].sentAt = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
+      LogEvent("INFO", "QUEUE", "", StringFormat("✅ Delivered qid=%d", g_queue[idx].id));
+      return true;
+     }
+     LogEvent("WARN", "QUEUE", "",
+         StringFormat("⚠️ Retry failed qid=%d http=%d err=%d body=%s",
+                       g_queue[idx].id, http, GetLastError(),
+                       CharArrayToString(result, 0, -1, CP_UTF8)));
+   return false;
+  }
+
+void FlushQueue()
+  {
+   datetime cutoff = TimeCurrent() - 3600;
+   int newSize = 0;
+   for(int i = 0; i < g_queueSize; i++)
+     {
+      datetime created = (datetime)StringToTime(g_queue[i].createdAt);
+      if(created >= cutoff)
+        { g_queue[newSize] = g_queue[i]; newSize++; }
+     }
+   if(newSize < g_queueSize)
+     {
+      LogEvent("INFO", "QUEUE", "",
+               StringFormat("Dropped %d stale items", g_queueSize - newSize));
+      g_queueSize = newSize;
+      SaveQueueToDisk();
+     }
+
+   int pending = 0;
+   for(int i = 0; i < g_queueSize; i++) if(!g_queue[i].sent) pending++;
+   if(pending == 0) return;
+   int delivered = 0;
+   for(int i = 0; i < g_queueSize; i++)
+      if(!g_queue[i].sent && TrySendEntry(i)) delivered++;
+   if(delivered > 0)
+     {
+      newSize = 0;
+      for(int i = 0; i < g_queueSize; i++)
+         if(!g_queue[i].sent) { g_queue[newSize] = g_queue[i]; newSize++; }
+      g_queueSize = newSize;
+      SaveQueueToDisk();
+      LogEvent("INFO", "QUEUE", "",
+               StringFormat("Flushed %d | remaining %d", delivered, g_queueSize));
+     }
+  }
+
+
+// ════════════════════════════════════════════════════════════════════
+//  JSON HELPERS
+// ════════════════════════════════════════════════════════════════════
+
+double JSONDouble(string obj, string key)
+  {
+   string k = "\"" + key + "\"";
+   int p = StringFind(obj, k); if(p < 0) return 0;
+   int c = StringFind(obj, ":", p); if(c < 0) return 0;
+   int s = c + 1;
+   while(s < StringLen(obj) &&
+         (StringGetCharacter(obj, s) == ' ' || StringGetCharacter(obj, s) == '\t')) s++;
+   int e = s;
+   while(e < StringLen(obj))
+     { ushort ch = StringGetCharacter(obj, e); if(ch == ',' || ch == '}') break; e++; }
+   return StringToDouble(StringSubstr(obj, s, e - s));
+  }
+
+string JSONString(string obj, string key)
+  {
+   string k  = "\"" + key + "\"";
+   int    p  = StringFind(obj, k); if(p < 0) return "";
+   int    q1 = StringFind(obj, "\"", StringFind(obj, ":", p)); if(q1 < 0) return "";
+   int    q2 = StringFind(obj, "\"", q1 + 1); if(q2 < 0) return "";
+   return StringSubstr(obj, q1 + 1, q2 - q1 - 1);
+  }
+
+
+// ────────────────────────────────────────────────────────────────────
+//  MapSymbol
+// ────────────────────────────────────────────────────────────────────
+string MapSymbol(string raw)
+  {
+   string s = raw;
+   StringToUpper(s);
+   string inpGold = InpGold; StringToUpper(inpGold);
+   if(s == inpGold)               return InpGold;
+   if(StringFind(s, "GOLD") == 0) return InpGold;
+   if(StringFind(s, "GC")   == 0) return InpGold;
+   LogEvent("WARN", "SHEET", "", StringFormat("Unknown symbol: %s — using as-is", raw));
+   return raw;
+  }
+
+double GetLotSize(string symbol)
+  {
+   string s = symbol; StringToUpper(s);
+   if(StringFind(s, "GOLD") == 0) return 0.1;
+   if(StringFind(s, "GC")   == 0) return 0.1;
+   return InpLotSize;
+  }
+
+
+// ────────────────────────────────────────────────────────────────────
+//  ParseJSON
+// ────────────────────────────────────────────────────────────────────
+bool ParseJSON(string json)
+  {
+   g_rowCount = 0;
+   if(StringFind(json, "rows") < 0)
+     { LogEvent("ERROR", "SHEET", "", "Invalid JSON — no 'rows' key"); return false; }
+
+   int pos = 0;
+   while(g_rowCount < MAX_ROWS)
+     {
+      int s = StringFind(json, "{", pos);
+      int e = StringFind(json, "}", s);
+      if(s < 0 || e < 0) break;
+      string obj = StringSubstr(json, s, e - s + 1);
+      if(StringFind(obj, "buy_price") < 0) { pos = e + 1; continue; }
+
+      GridRow r;
+      r.valid     = false;
+      r.rowIndex  = (int)JSONDouble(obj, "row");
+      r.symbol    = MapSymbol(JSONString(obj, "symbol"));
+      r.buyPrice  = JSONDouble(obj, "buy_price");
+      r.qty       = JSONDouble(obj, "qty");
+      r.sellPrice = JSONDouble(obj, "sell_price");
+      r.lotSize   = JSONDouble(obj, "buy_qty");
+      if(r.lotSize <= 0) r.lotSize = InpLotSize;
+
+      if(r.rowIndex > 0 && r.buyPrice > 0 && r.sellPrice > 0)
+        { r.valid = true; g_rows[g_rowCount++] = r; }
+      pos = e + 1;
+     }
+   return g_rowCount > 0;
+  }
+
+
+// ════════════════════════════════════════════════════════════════════
+//  SHEET COMMUNICATION
+// ════════════════════════════════════════════════════════════════════
+
+int FetchLadder()
+  {
+   char post[], result[]; string resHeaders;
+   int http = WebRequest("GET", InpGetURL, "Content-Type: application/json\r\n",
+                         HTTP_TIMEOUT, post, result, resHeaders);
+   if(http == -1)
+     { LogEvent("ERROR", "SHEET", "", StringFormat("GET failed err=%d", GetLastError())); return FETCH_ERROR; }
+   if(http != 200)
+     {
+      LogEvent("ERROR", "SHEET", "",
+               StringFormat("GET HTTP %d headers=%s body=%s",
+                             http, resHeaders, CharArrayToString(result, 0, -1, CP_UTF8)));
+      return FETCH_ERROR;
+     }
+
+   string json     = CharArrayToString(result);
+   bool   serverOk = (StringFind(json, "\"ok\":true") >= 0);
+   if(!serverOk)
+     {
+      LogEvent("ERROR", "SHEET", "", StringFormat("Server ok=false | %s", JSONString(json, "error")));
+      return FETCH_ERROR;
+     }
+
+   int skipped = (int)JSONDouble(json, "skipped");
+   if(skipped > 0)
+     {
+      int dbgStart = StringFind(json, "\"debug\":[");
+      if(dbgStart >= 0)
+        {
+         int dbgEnd = StringFind(json, "]", dbgStart);
+         LogEvent("WARN", "SHEET", "",
+                  StringFormat("%d row(s) skipped: %s",
+                               skipped, StringSubstr(json, dbgStart, dbgEnd - dbgStart + 1)));
+        }
+      else
+         LogEvent("WARN", "SHEET", "", StringFormat("%d row(s) skipped", skipped));
+     }
+
+   bool parsed = ParseJSON(json);
+   if(!parsed)
+     {
+      LogEvent("WARN", "SHEET", "", StringFormat("0 valid rows | skipped=%d", skipped));
+      return FETCH_EMPTY;
+     }
+   //LogEvent("INFO", "SHEET", "", StringFormat("Ladder OK | rows=%d skipped=%d", g_rowCount, skipped));
+   return FETCH_OK;
+  }
+
+// [v4.9r4-2] "sheet":"limits" added as first field
+void PostSheet(int rowIndex, double qty, string statusCode, string symbol)
+  {
+   string body = (qty >= 0)
+     ? StringFormat("{\"sheet\":\"limits\",\"row\":%d,\"qty\":%.2f,\"status\":\"%s\",\"symbol\":\"%s\"}",
+                     rowIndex, qty, statusCode, symbol)
+     : StringFormat("{\"sheet\":\"limits\",\"row\":%d,\"status\":\"%s\",\"symbol\":\"%s\"}",
+                     rowIndex, statusCode, symbol);
+   LogEvent("INFO", "SHEET", symbol, StringFormat("PostSheet row=%d status=%s", rowIndex, statusCode));
+   char post_buf[], result[]; string resHeaders;
+   StringToCharArray(body, post_buf, 0, StringLen(body));
+   int http = WebRequest("POST", InpPostURL, "Content-Type: application/json\r\n",
+                         HTTP_TIMEOUT, post_buf, result, resHeaders);
+   if(http == 200)
+     {
+      string resp = CharArrayToString(result);
+      if(StringFind(resp, "\"error\"") >= 0)
+         LogEvent("ERROR", "SHEET", symbol,
+                  StringFormat("❌ Sheet error row=%d | %s", rowIndex, resp));
+      else
+         LogEvent("INFO", "SHEET", symbol,
+                  StringFormat("📤 Updated row=%d | %s", rowIndex, resp));
+     }
+   else
+     {
+      LogEvent("WARN", "SHEET", symbol, StringFormat("⚠️ POST failed http=%d — queuing", http));
+      QueuePost(InpPostURL, body);
+     }
+  }
+
+// [v4.9r4-2] "sheet":"trades" — [v4.9r5-6] comment corrected: this always sent
+// "trades" (matching the other EA builds); an earlier changelog line claiming
+// it changed to "history" was stale documentation, not actual behaviour.
+void PostTrade(TradeRecord &tr, string tradeType)
+  {
+   if(tradeType == "BUY" && tr.brokerage == 0)
+     {
+      HistorySelect(TimeCurrent() - 120, TimeCurrent());
+      for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+        {
+         ulong ticket = HistoryDealGetTicket(i);
+         if(HistoryDealGetString(ticket, DEAL_SYMBOL) == tr.symbol &&
+            HistoryDealGetInteger(ticket, DEAL_TYPE)  == DEAL_TYPE_BUY)
+           { tr.brokerage = MathAbs(HistoryDealGetDouble(ticket, DEAL_COMMISSION)); break; }
+        }
+     }
+   string body = StringFormat(
+     "{\"sheet\":\"trades\",\"trade_type\":\"%s\","
+     "\"tradeTime\":\"%s\",\"symbol\":\"%s\","
+     "\"buy_price\":%.2f,\"qty\":%.2f,\"sell_price\":%.2f,"
+     "\"brokerage\":%.2f,\"profit\":%.2f}",
+     tradeType, tr.tradeTime, tr.symbol,
+     tr.buyPrice, tr.qty, tr.sellPrice, tr.brokerage, tr.profit);
+   char post_buf[], result[]; string resHeaders;
+   StringToCharArray(body, post_buf, 0, StringLen(body));
+   int http = WebRequest("POST", InpPostURL, "Content-Type: application/json\r\n",
+                         HTTP_TIMEOUT, post_buf, result, resHeaders);
+   if(http != 200)
+     { LogEvent("WARN", "TRADE", tr.symbol, StringFormat("Trade POST failed http=%d — queuing", http));
+       QueuePost(InpPostURL, body); }
+  }
+
+// [v4.9r4-2] New — posts WARN/ERROR events to the Warnings tab
+void PostWarning(string level, string category, string symbol, string message)
+  {
+   string ts   = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
+   string body = StringFormat(
+      "{\"sheet\":\"warnings\",\"timestamp\":\"%s\",\"level\":\"%s\","
+      "\"category\":\"%s\",\"symbol\":\"%s\",\"message\":\"%s\"}",
+      ts, level, category, symbol, message);
+   char post_buf[], result[]; string resHeaders;
+   StringToCharArray(body, post_buf, 0, StringLen(body));
+   int http = WebRequest("POST", InpPostURL, "Content-Type: application/json\r\n",
+                         HTTP_TIMEOUT, post_buf, result, resHeaders);
+   if(http != 200)
+      QueuePost(InpPostURL, body);  // retry queue catches it — no LogEvent here to avoid recursion
+  }
+
+
+// ════════════════════════════════════════════════════════════════════
+//  ORDER MANAGEMENT
+// ════════════════════════════════════════════════════════════════════
+
+string RowTag(int rowIndex, string symbol, string side)
+  { return ROW_PREFIX + IntegerToString(rowIndex) + "_" + symbol + "_" + side; }
+
+int ParseRowIndex(string comment)
+  {
+   int prefixLen = StringLen(ROW_PREFIX);
+   if(StringFind(comment, ROW_PREFIX) != 0) return -1;
+   string rest  = StringSubstr(comment, prefixLen);
+   int    under = StringFind(rest, "_"); if(under < 0) return -1;
+   int    idx   = (int)StringToInteger(StringSubstr(rest, 0, under));
+   return idx > 0 ? idx : -1;
+  }
+
+bool HasOrderAtPrice(string tag, double price, ENUM_ORDER_TYPE type, string symbol, double lot = 0)
+  {
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   for(int i = 0; i < OrdersTotal(); i++)
+     {
+      ulong ticket = OrderGetTicket(i); if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL)  != symbol)   continue;
+      if(OrderGetInteger(ORDER_MAGIC)  != InpMagic)  continue;
+      if(OrderGetString(ORDER_COMMENT) != tag)       continue;
+      if((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) != type) continue;
+      if(MathAbs(OrderGetDouble(ORDER_PRICE_OPEN) - price) < point)
+        {
+         if(lot > 0 && MathAbs(OrderGetDouble(ORDER_VOLUME_INITIAL) - lot) > 0.001)
+            return false;
+         return true;
+        }
+     }
+   return false;
+  }
+
+void CancelByTag(string tag, int rowIndex, string statusCode, string symbol)
+  {
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = OrderGetTicket(i); if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL)  != symbol)  continue;
+      if(OrderGetInteger(ORDER_MAGIC)  != InpMagic) continue;
+      if(OrderGetString(ORDER_COMMENT) != tag)      continue;
+      if(g_trade.OrderDelete(ticket))
+        { LogEvent("INFO", "ORDER", symbol,
+                   StringFormat("🗑️ Cancelled ticket=%I64u tag=%s", ticket, tag));
+          PostSheet(rowIndex, -1, statusCode, symbol); }
+      else
+         LogEvent("ERROR", "ORDER", symbol,
+                  StringFormat("Cancel failed ticket=%I64u | %s",
+                                ticket, g_trade.ResultRetcodeDescription()));
+     }
+  }
+
+bool PlaceOrder(ENUM_ORDER_TYPE type, double price, string tag,
+                int rowIndex, string symbol, double lot)
+  {
+   if(!SymbolSelect(symbol, true))
+     { LogEvent("ERROR", "ORDER", symbol,
+                StringFormat("❌ SymbolSelect failed — %s not available", symbol));
+       return false; }
+
+   double p = NormalizeDouble(price, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS));
+
+   {
+      double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+      if(ask > 0 && bid > 0)
+        {
+         bool badBuyLimit  = (type == ORDER_TYPE_BUY_LIMIT  && p >= ask);
+         bool badSellLimit = (type == ORDER_TYPE_SELL_LIMIT && p <= bid);
+         if(badBuyLimit || badSellLimit)
+           {
+            LogEvent("WARN", "ORDER", symbol,
+                     StringFormat("⚠️ Price sanity fail — skipping %s row=%d "
+                                  "price=%.2f ask=%.2f bid=%.2f",
+                                  (type == ORDER_TYPE_BUY_LIMIT) ? "BuyLimit" : "SellLimit",
+                                  rowIndex, p, ask, bid));
+            return false;
+           }
+        }
+   }
+
+   for(int attempt = 1; attempt <= InpRetryCount; attempt++)
+     {
+      bool ok = (type == ORDER_TYPE_BUY_LIMIT)
+             ? g_trade.BuyLimit (lot, p, symbol, 0, 0, ORDER_TIME_DAY, 0, tag)
+             : g_trade.SellLimit(lot, p, symbol, 0, 0, ORDER_TIME_DAY, 0, tag);
+      if(ok)
+        {
+         string statCode = (type == ORDER_TYPE_BUY_LIMIT) ? "BUY_LIMIT_PLACED" : "SELL_LIMIT_PLACED";
+         MarkPlaced(tag);
+         LogEvent("INFO", "ORDER", symbol,
+                  StringFormat("📌 %s row=%d price=%.2f lot=%.2f",
+                  (type == ORDER_TYPE_BUY_LIMIT) ? "BuyLimit" : "SellLimit",
+                  rowIndex, p, lot));
+         PostSheet(rowIndex, -1, statCode, symbol);
+         return true;
+        }
+      LogEvent("WARN", "ORDER", symbol,
+               StringFormat("⚠️ attempt %d/%d failed row=%d retcode=%d",
+                             attempt, InpRetryCount, rowIndex, g_trade.ResultRetcode()));
+      if(attempt < InpRetryCount) Sleep(InpRetryDelay);
+     }
+   LogEvent("ERROR", "ORDER", symbol,
+            StringFormat("❌ Order FAILED after %d attempts row=%d", InpRetryCount, rowIndex));
+   return false;
+  }
+
+void CleanOrphans(string symbol)
+  {
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+     {
+      ulong ticket = OrderGetTicket(i); if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL)  != symbol)  continue;
+      if(OrderGetInteger(ORDER_MAGIC)  != InpMagic) continue;
+      string comment = OrderGetString(ORDER_COMMENT);
+      if(StringFind(comment, ROW_PREFIX) != 0) continue;
+      int rowIndex = ParseRowIndex(comment); if(rowIndex < 0) continue;
+      bool found = false;
+      for(int j = 0; j < g_rowCount; j++)
+         if(g_rows[j].symbol == symbol && g_rows[j].rowIndex == rowIndex)
+           { found = true; break; }
+      if(!found && g_trade.OrderDelete(ticket))
+         LogEvent("INFO", "ORDER", symbol,
+                  StringFormat("🧹 Orphan removed ticket=%I64u row=%d", ticket, rowIndex));
+     }
+  }
+
+
+// ════════════════════════════════════════════════════════════════════
+//  TRADING LOGIC
+// ════════════════════════════════════════════════════════════════════
+// Synchronous retry wrapper for self-heal path.
+// Unlike PostSheet() (which queues immediately on failure), this retries
+// inline up to maxRetries times before giving up — used only when a missed
+// fill is detected and we need to know definitively whether the sheet
+// update succeeded before deciding to StopEA.
+bool TrySheetUpdateSync(int rowIndex, double qty, string statusCode, string symbol,
+                         int maxRetries = 3, int retryDelayMs = 800)
+  {
+   string body = (qty >= 0)
+     ? StringFormat("{\"sheet\":\"limits\",\"row\":%d,\"qty\":%.2f,\"status\":\"%s\",\"symbol\":\"%s\"}",
+                     rowIndex, qty, statusCode, symbol)
+     : StringFormat("{\"sheet\":\"limits\",\"row\":%d,\"status\":\"%s\",\"symbol\":\"%s\"}",
+                     rowIndex, statusCode, symbol);
+
+   for(int attempt = 1; attempt <= maxRetries; attempt++)
+     {
+      char post_buf[], result[]; string resHeaders;
+      StringToCharArray(body, post_buf, 0, StringLen(body));
+      int http = WebRequest("POST", InpPostURL, "Content-Type: application/json\r\n",
+                            HTTP_TIMEOUT, post_buf, result, resHeaders);
+
+      if(http == 200)
+        {
+         string resp = CharArrayToString(result);
+         if(StringFind(resp, "\"error\"") < 0)
+           {
+            LogEvent("INFO", "SHEET", symbol,
+                     StringFormat("Self-heal sheet update OK (attempt %d/%d) row=%d",
+                                  attempt, maxRetries, rowIndex));
+            return true;
+           }
+         LogEvent("WARN", "SHEET", symbol,
+                  StringFormat("Self-heal attempt %d/%d — sheet returned error: %s",
+                               attempt, maxRetries, resp));
+        }
+      else
+         LogEvent("WARN", "SHEET", symbol,
+                  StringFormat("Self-heal attempt %d/%d — HTTP %d err=%d",
+                               attempt, maxRetries, http, GetLastError()));
+
+      if(attempt < maxRetries) Sleep(retryDelayMs);
+     }
+   return false;
+  }
+  
+void ProcessRow(GridRow &row)
+  {
+   double lot     = row.lotSize;
+   string buyTag  = RowTag(row.rowIndex, row.symbol, "BUY");
+   string sellTag = RowTag(row.rowIndex, row.symbol, "SELL");
+
+   // [v4.9r4-1 / v4.9r5-1] Variable fill lock.
+   //   The real confirmation check (does the sheet's qty actually match the
+   //   expected post-fill direction?) happens in SyncAll(), right after a
+   //   fresh sheet fetch, using g_fillLockWaitBuy[]. Here we only handle the
+   //   ceiling fallback: if the sheet never confirms within
+   //   FILL_LOCK_HARD_CEILING seconds, release with a warning so the row
+   //   doesn't freeze permanently.
+   if(row.rowIndex < MAX_ROWS && g_fillLockActive[row.rowIndex])
+     {
+      int elapsedSecs = (int)(TimeCurrent() - g_fillLockTime[row.rowIndex]);
+      bool ceilingHit = (elapsedSecs >= FILL_LOCK_HARD_CEILING);
+
+      if(ceilingHit)
+        {
+         StopEA(StringFormat("Row %d fill-lock ceiling hit (%ds) — sheet never confirmed the fill",
+                              row.rowIndex, elapsedSecs));
+         return;
+        }
+      else
+        {
+         LogEvent("INFO", "ORDER", row.symbol,
+                  StringFormat("Row %d fill-lock active — %ds elapsed, waiting sheet confirm",
+                               row.rowIndex, elapsedSecs));
+         return;
+        }
+     }
+
+   if(row.qty < 0.05)
+     {
+      CancelByTag(sellTag, row.rowIndex, "SELL_LIMIT_CANCELLED", row.symbol);
+
+      if(AnyOrderAtPrice(row.buyPrice, ORDER_TYPE_BUY_LIMIT, row.symbol))              return;
+      if(WasRecentlyFilled(buyTag, row.symbol, ORDER_TYPE_BUY_LIMIT, row.rowIndex, row.buyPrice))
+        {
+         LogEvent("WARN", "ORDER", row.symbol,
+                  StringFormat("Row %d BUY fill missed by OnTradeTransaction — attempting self-heal "
+                               "(tag=%s price=%.2f)", row.rowIndex, buyTag, row.buyPrice));
+
+         bool healed = TrySheetUpdateSync(row.rowIndex, row.lotSize, "BUY_FILLED", row.symbol);
+
+         if(healed)
+           {
+            if(row.rowIndex < MAX_ROWS)
+              {
+               g_fillLockTime[row.rowIndex]    = TimeCurrent();
+               g_fillLockActive[row.rowIndex]  = true;
+               g_fillLockWaitBuy[row.rowIndex] = true;
+               SaveFillLocks();
+              }
+            SendAlert(StringFormat("SELF-HEALED missed BUY fill — %s row=%d @ %.2f",
+                                   row.symbol, row.rowIndex, row.buyPrice), ALERT_HIGH);
+            return;
+           }
+
+         StopEA(StringFormat("Row %d BUY recently filled but sheet update failed after 3 attempts "
+                              "(tag=%s price=%.2f)", row.rowIndex, buyTag, row.buyPrice));
+         return;
+        }
+      if(IsRecentlyPlaced(buyTag))                                                      return;
+      if(HasOrderAtPrice(buyTag, row.buyPrice, ORDER_TYPE_BUY_LIMIT, row.symbol, lot))  return;
+
+      CancelByTag(buyTag, row.rowIndex, "BUY_LIMIT_CANCELLED", row.symbol);
+      PlaceOrder(ORDER_TYPE_BUY_LIMIT, row.buyPrice, buyTag, row.rowIndex, row.symbol, lot);
+     }
+   else
+     {
+      CancelByTag(buyTag, row.rowIndex, "BUY_LIMIT_CANCELLED", row.symbol);
+
+      if(AnyOrderAtPrice(row.sellPrice, ORDER_TYPE_SELL_LIMIT, row.symbol))             return;
+      if(WasRecentlyFilled(sellTag, row.symbol, ORDER_TYPE_SELL_LIMIT, row.rowIndex, row.sellPrice))
+        {
+         LogEvent("WARN", "ORDER", row.symbol,
+                  StringFormat("Row %d SELL fill missed by OnTradeTransaction — attempting self-heal "
+                               "(tag=%s price=%.2f)", row.rowIndex, sellTag, row.sellPrice));
+
+         bool healed = TrySheetUpdateSync(row.rowIndex, 0.0, "SELL_FILLED", row.symbol);
+
+         if(healed)
+           {
+            if(row.rowIndex < MAX_ROWS)
+              {
+               g_fillLockTime[row.rowIndex]    = TimeCurrent();
+               g_fillLockActive[row.rowIndex]  = true;
+               g_fillLockWaitBuy[row.rowIndex] = false;
+               SaveFillLocks();
+              }
+            SendAlert(StringFormat("SELF-HEALED missed SELL fill — %s row=%d @ %.2f",
+                                   row.symbol, row.rowIndex, row.sellPrice), ALERT_HIGH);
+            return;
+           }
+
+         StopEA(StringFormat("Row %d SELL recently filled but sheet update failed after 3 attempts "
+                              "(tag=%s price=%.2f)", row.rowIndex, sellTag, row.sellPrice));
+         return;
+        }
+      if(IsRecentlyPlaced(sellTag))                                                       return;
+      if(HasOrderAtPrice(sellTag, row.sellPrice, ORDER_TYPE_SELL_LIMIT, row.symbol, lot)) return;
+
+      CancelByTag(sellTag, row.rowIndex, "SELL_LIMIT_CANCELLED", row.symbol);
+      PlaceOrder(ORDER_TYPE_SELL_LIMIT, row.sellPrice, sellTag, row.rowIndex, row.symbol, lot);
+     }
+  }
+
+
+// ════════════════════════════════════════════════════════════════════
+//  SYNC
+// ════════════════════════════════════════════════════════════════════
+
+void SyncAll()
+  {
+   int fetchResult = FetchLadder();
+
+   if(fetchResult == FETCH_ERROR)
+     {
+      if(!g_wasDisconnected)
+        {
+         g_disconnectTime  = TimeCurrent();
+         g_wasDisconnected = true;
+         LogEvent("WARN", "SYSTEM", "",
+                  StringFormat("Disconnect detected at %s — gap timer started",
+                               TimeToString(g_disconnectTime, TIME_SECONDS)));
+        }
+      LogEvent("WARN", "SYSTEM", "", "Ladder fetch failed — skipping sync cycle");
+      return;
+     }
+
+   if(g_wasDisconnected)
+      ReconcileAfterReconnect();
+
+   g_lastSuccessfulSync = TimeCurrent();
+
+   if(fetchResult == FETCH_EMPTY)
+     {
+      LogEvent("INFO", "SYSTEM", "", "Sheet empty — skipping order sync");
+      for(int s = 0; s < g_symbolCount; s++) CleanOrphans(g_symbols[s]);
+      return;
+     }
+
+   // [v4.9r5-1] FIX: release fill locks ONLY when the sheet's qty actually
+   // confirms the direction we're waiting for (g_fillLockWaitBuy[]) — not
+   // unconditionally on the next successful fetch. Buy fill confirmed →
+   // sheet now shows qty >= 0.05 (position held). Sell fill confirmed →
+   // sheet now shows qty < 0.05 (back to flat).
+   for(int i = 0; i < g_rowCount; i++)
+     {
+      int ri = g_rows[i].rowIndex;
+      if(ri < 0 || ri >= MAX_ROWS)          continue;
+      if(!g_fillLockActive[ri])             continue;
+
+      int  elapsedSecs   = (int)(TimeCurrent() - g_fillLockTime[ri]);
+      bool expectHolding  = g_fillLockWaitBuy[ri];               // true = waiting for qty>=0.05
+      bool sheetConfirmed = expectHolding ? (g_rows[i].qty >= 0.05)
+                                           : (g_rows[i].qty <  0.05);
+
+      if(sheetConfirmed)
+        {
+         g_fillLockActive[ri] = false;
+         SaveFillLocks();
+         LogEvent("INFO", "ORDER", g_rows[i].symbol,
+                  StringFormat("Row %d fill-lock released — sheet confirmed qty=%.2f "
+                               "(expected %s) after %ds",
+                               ri, g_rows[i].qty, expectHolding ? "BUY" : "SELL", elapsedSecs));
+        }
+      else
+        {
+         LogEvent("INFO", "ORDER", g_rows[i].symbol,
+                  StringFormat("Row %d fill-lock still waiting — sheet qty=%.2f does not "
+                               "yet confirm expected %s (%ds elapsed)",
+                               ri, g_rows[i].qty, expectHolding ? "BUY" : "SELL", elapsedSecs));
+         // ceiling fallback still handled inside ProcessRow()
+        }
+     }
+
+   for(int s = 0; s < g_symbolCount; s++) CleanOrphans(g_symbols[s]);
+   for(int i = 0; i < g_rowCount; i++)
+      if(g_rows[i].valid) ProcessRow(g_rows[i]);
+  }
+
+
+// ════════════════════════════════════════════════════════════════════
+//  MT5 EVENT HANDLERS
+// ════════════════════════════════════════════════════════════════════
+
+int OnInit()
+  {
+   if(InpGetURL == "" || InpPostURL == "")
+     { Alert("GridLadder: Sheet URLs must be filled in!"); return INIT_PARAMETERS_INCORRECT; }
+   if(InpGold == "")
+     { Alert("GridLadder: InpGold must be filled in!"); return INIT_PARAMETERS_INCORRECT; }
+
+   g_initTime = TimeCurrent();
+   LogEvent("INFO", "SYSTEM", "",
+            StringFormat("Init hold started — syncs blocked for %ds", INIT_HOLD_SECONDS));
+
+   LoadFillLocks();
+
+   g_symbolCount = 0;
+   g_symbols[g_symbolCount++] = InpGold;
+
+   if(SymbolSelect(InpGold, true))
+      LogEvent("INFO", "SYSTEM", "", StringFormat("✅ Symbol selected: %s", InpGold));
+   else
+      LogEvent("WARN", "SYSTEM", "",
+               StringFormat("⚠️ Cannot select: %s — check broker name", InpGold));
+
+   g_trade.SetExpertMagicNumber(InpMagic);
+   g_trade.SetDeviationInPoints(InpSlippage);
+   g_trade.SetTypeFilling(ORDER_FILLING_RETURN);
+   g_trade.SetAsyncMode(false);
+
+   if(!FileIsExist(LOG_FILE, FILE_COMMON))
+      WriteLogLine("timestamp,level,category,symbol,message,extra");
+
+   LoadQueueFromDisk();
+   EventSetTimer(InpPollSeconds);
+
+   LogEvent("INFO", "SYSTEM", "",
+            StringFormat("GridLadder v4.9r5 | Magic=%d | Gold=%s | Poll=%ds | "
+                         "PlacedTTL=%ds | LockCeiling=%ds | InitHold=%ds | DeadMan=%ds",
+                          InpMagic, InpGold, InpPollSeconds,
+                          PLACED_TTL, FILL_LOCK_HARD_CEILING, INIT_HOLD_SECONDS,
+                          InpDeadManSeconds));
+
+   FlushQueue();
+   g_initialized = true;
+   return INIT_SUCCEEDED;
+  }
+
+void OnDeinit(const int reason)
+  {
+   EventKillTimer();
+   FlushQueue();
+   LogEvent("INFO", "SYSTEM", "", StringFormat("EA stopped reason=%d", reason));
+  }
+
+void OnTimer()
+  {
+   if(TimeCurrent() - g_initTime < INIT_HOLD_SECONDS)
+     {
+      int remaining = (int)(INIT_HOLD_SECONDS - (TimeCurrent() - g_initTime));
+      LogEvent("INFO", "SYSTEM", "",
+               StringFormat("Init hold active — %ds remaining, skipping sync", remaining));
+      return;
+     }
+
+   if(g_lastSuccessfulSync > 0)
+     {
+      int silenceSecs = (int)(TimeCurrent() - g_lastSuccessfulSync);
+      if(silenceSecs >= InpDeadManSeconds &&
+         TimeCurrent() - g_lastDeadManAlert >= InpDeadManSeconds)
+        {
+         g_lastDeadManAlert = TimeCurrent();
+         SendAlert(StringFormat(
+            "SILENT for %d min — VPS or MT5 may be down | %s | last sync %s",
+            silenceSecs / 60,
+            InpGold,
+            TimeToString(g_lastSuccessfulSync, TIME_SECONDS)),
+            ALERT_CRITICAL);
+        }
+     }
+
+   g_timerTick++;
+   SyncAll();
+   int flushEvery = (int)MathMax(1, MathRound((double)InpQueueRetrySeconds / InpPollSeconds));
+   if(g_timerTick % flushEvery == 0) FlushQueue();
+  }
+
+void OnTick() { }
+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest      &request,
+                        const MqlTradeResult       &result)
+  {
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+   ulong ticket = trans.deal; if(ticket == 0) return;
+   if(!HistoryDealSelect(ticket)) return;
+
+   static ulong s_lastDeal = 0;
+   if(ticket == s_lastDeal) return;
+   s_lastDeal = ticket;
+
+   if((long)HistoryDealGetInteger(ticket, DEAL_MAGIC) != InpMagic) return;
+
+   string comment    = HistoryDealGetString (ticket, DEAL_COMMENT);
+   long   dealType   = HistoryDealGetInteger(ticket, DEAL_TYPE);
+   long   dealEntry  = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+   double dealPrice  = HistoryDealGetDouble (ticket, DEAL_PRICE);
+   double dealVolume = HistoryDealGetDouble (ticket, DEAL_VOLUME);
+   string sym        = HistoryDealGetString (ticket, DEAL_SYMBOL);
+   int    rowIndex   = ParseRowIndex(comment);
+
+   if(StringFind(comment, ROW_PREFIX) != 0)
+     {
+      LogEvent("WARN", "TRADE", sym,
+               StringFormat("⚠️ Magic matched but no ROW_PREFIX — comment='%s' "
+                            "ticket=%I64u price=%.2f",
+                            comment, ticket, dealPrice));
+      double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+      for(int i = 0; i < g_rowCount; i++)
+        {
+         if(g_rows[i].symbol != sym) continue;
+         bool buyMatch  = (dealType == DEAL_TYPE_BUY  &&
+                           MathAbs(g_rows[i].buyPrice  - dealPrice) < point * 5);
+         bool sellMatch = (dealType == DEAL_TYPE_SELL &&
+                           MathAbs(g_rows[i].sellPrice - dealPrice) < point * 5);
+         if(buyMatch || sellMatch)
+           {
+            StopEA(StringFormat("Deal ticket=%I64u on %s matched row=%d by PRICE only — "
+                                 "comment was '%s' instead of expected tag",
+                                 ticket, sym, g_rows[i].rowIndex, comment));
+            return;
+           }
+        }
+      return;
+     }
+
+   if(rowIndex < 0)
+     { LogEvent("WARN", "TRADE", sym,
+                StringFormat("Cannot parse row from: %s", comment)); return; }
+
+   string ts = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS);
+
+   if(dealType == DEAL_TYPE_BUY && dealEntry == DEAL_ENTRY_IN)
+     {
+      double commission = MathAbs(HistoryDealGetDouble(ticket, DEAL_COMMISSION));
+      LogEvent("INFO", "TRADE", sym,
+               StringFormat("✅ BUY FILLED row=%d price=%.2f vol=%.2f comm=%.2f",
+                             rowIndex, dealPrice, dealVolume, commission));
+
+      // [v4.9r4-1 / v4.9r5-1] Stamp variable lock — waiting for sheet to
+      // confirm the position is now held (qty >= 0.05).
+      if(rowIndex < MAX_ROWS)
+        {
+         g_fillLockTime[rowIndex]    = TimeCurrent();
+         g_fillLockActive[rowIndex]  = true;
+         g_fillLockWaitBuy[rowIndex] = true;
+         SaveFillLocks();
+        }
+
+      PostSheet(rowIndex, dealVolume, "BUY_FILLED", sym);
+      SendAlert(StringFormat("BUY FILLED %s @ %.2f vol=%.2f",
+                             sym, dealPrice, dealVolume), ALERT_HIGH);
+
+      TradeRecord tr;
+      tr.tradeTime = ts;        tr.symbol    = sym;
+      tr.buyPrice  = dealPrice; tr.qty       = dealVolume;
+      tr.sellPrice = 0;         tr.brokerage = commission;
+      tr.profit    = 0;
+      PostTrade(tr, "BUY");
+     }
+   else if(dealType == DEAL_TYPE_SELL && dealEntry == DEAL_ENTRY_OUT)
+     {
+      double commission = MathAbs(HistoryDealGetDouble(ticket, DEAL_COMMISSION));
+      double swap       = HistoryDealGetDouble(ticket, DEAL_SWAP);
+      double dealProfit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+      LogEvent("INFO", "TRADE", sym,
+               StringFormat("✅ SELL FILLED row=%d price=%.2f profit=%.2f",
+                             rowIndex, dealPrice, dealProfit));
+
+      // [v4.9r5-2] FIX: this build never stamped a fill lock on the sell
+      // side at all — a sell-side row could re-place an order before the
+      // sheet caught up. Now stamps the same way the buy path does, waiting
+      // for the sheet to confirm the position is flat (qty < 0.05).
+      if(rowIndex < MAX_ROWS)
+        {
+         g_fillLockTime[rowIndex]    = TimeCurrent();
+         g_fillLockActive[rowIndex]  = true;
+         g_fillLockWaitBuy[rowIndex] = false;
+         SaveFillLocks();
+        }
+
+      PostSheet(rowIndex, 0.0, "SELL_FILLED", sym);
+      SendAlert(StringFormat("SELL FILLED %s @ %.2f vol=%.2f",
+                             sym, dealPrice, dealVolume), ALERT_HIGH);
+
+      TradeRecord tr;
+      tr.tradeTime = ts;        tr.symbol    = sym;
+      tr.buyPrice  = 0;         tr.qty       = dealVolume;
+      tr.sellPrice = dealPrice;
+      tr.brokerage = commission + MathAbs(swap);
+      tr.profit    = dealProfit;
+      PostTrade(tr, "SELL");
+     }
+  }
+//+------------------------------------------------------------------+
